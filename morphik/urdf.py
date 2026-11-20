@@ -21,6 +21,8 @@ class URDFChain:
     tip_link: str
     joint_names: tuple[str, ...]
     midpoints: Tensor
+    lower_limits: Tensor
+    upper_limits: Tensor
 
     def to_canonical_angles(self, original: Tensor) -> Tensor:
         centered = (original - self.midpoints.to(original)) * self.frame.joint_signs[0].to(original)
@@ -90,7 +92,7 @@ def load_urdf(path: str | Path, tip: str, *, base: str | None = None) -> URDFCha
 
     position = torch.zeros(3, dtype=torch.float64)
     orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
-    points, axes, limits, midpoints, names = [], [], [], [], []
+    points, axes, intervals, names = [], [], [], []
     for joint in reversed(path_joints):
         translation, rotation = _origin(joint)
         position = position + rotate(orientation, translation)
@@ -111,16 +113,18 @@ def load_urdf(path: str | Path, tip: str, *, base: str | None = None) -> URDFCha
         if upper > lower:
             points.append(position)
             axes.append(rotate(orientation, local_axis))
-            limits.append((upper - lower) / 2)
-            midpoints.append(center)
+            intervals.append((lower, upper))
             names.append(name)
         orientation = multiply(orientation, axis_angle(local_axis, position.new_tensor(center)))
 
     if not 1 <= len(names) <= MAX_DOF:
         raise ValueError(f"Expected 1–{MAX_DOF} active joints on path, got {len(names)}")
+    lower_limits, upper_limits = position.new_tensor(intervals).unbind(dim=1)
+    half_ranges = (upper_limits - lower_limits) / 2
     robots, frame = canonicalize(
-        torch.stack(points)[None], torch.stack(axes)[None], position.new_tensor(limits)[None],
+        torch.stack(points)[None], torch.stack(axes)[None], half_ranges[None],
         position[None], orientation[None],
     )
     robots = replace(robots, radii=tapered_radii(robots, 0.018)).to(dtype=torch.float32)
-    return URDFChain(robots, frame, cursor, tip, tuple(names), position.new_tensor(midpoints))
+    midpoints = (upper_limits + lower_limits) / 2
+    return URDFChain(robots, frame, cursor, tip, tuple(names), midpoints, lower_limits, upper_limits)

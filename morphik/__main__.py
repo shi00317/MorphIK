@@ -97,6 +97,8 @@ def _solve(args: argparse.Namespace) -> None:
         joints = dls_step(robots, joints, position, orientation)
     final_position, final_orientation = pose_errors(robots, joints, position, orientation)
     angles = chain.to_urdf_angles(joints[0].cpu().to(chain.midpoints))
+    # Float32 centered limits can round past the original URDF bounds.
+    angles = angles.clamp(min=chain.lower_limits, max=chain.upper_limits)
     scale = float(chain.frame.scale.item())
     print(json.dumps({
         "base": chain.base_link,

@@ -8,7 +8,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from .geometry import MAX_DOF, RobotBatch, canonicalize
-from .kinematics import forward_kinematics, posed_chain
+from .kinematics import forward_kinematics, geometric_jacobian, posed_chain
 
 DOF_CLASSES = (6, 7, 8, 9)
 
@@ -79,7 +79,37 @@ def _procedural_robots(count: int, dof: int, generator: torch.Generator) -> Robo
     tool_quaternion = F.normalize(normals(count, 4), dim=-1)
     robots, _ = canonicalize(chain[:, :-1], axes, half_ranges, chain[:, -1], tool_quaternion)
     radii = tapered_radii(robots, 0.012 + 0.012 * uniform(count, 1))
-    return replace(robots, radii=radii).to(dtype=torch.float32)
+    return replace(robots, radii=radii)
+
+
+def _has_full_task_rank(robots: RobotBatch, generator: torch.Generator) -> Tensor:
+    """Keep chains with a locally six-dimensional task space at a sampled pose."""
+    remaining = torch.arange(len(robots))
+    accepted = torch.zeros(len(robots), dtype=torch.bool)
+    for _ in range(3):
+        pending = robots[remaining]
+        _, _, jacobian = geometric_jacobian(pending, _sample_angles(pending, generator))
+        singular_values = torch.linalg.svdvals(jacobian)
+        full_rank = singular_values[:, -1] > 1e-7 * singular_values[:, 0]
+        accepted[remaining[full_rank]] = True
+        remaining = remaining[~full_rank]
+        if not remaining.numel():
+            break
+    return accepted
+
+
+def _sample_morphologies(count: int, dof: int, generator: torch.Generator) -> RobotBatch:
+    """Reject degenerate proposals before assigning them to either split."""
+    batches = []
+    remaining = count
+    for _ in range(64):
+        robots = _procedural_robots(remaining, dof, generator)
+        accepted = robots[_has_full_task_rank(robots, generator)]
+        batches.append(accepted.to(dtype=torch.float32))
+        remaining -= len(accepted)
+        if not remaining:
+            return RobotBatch.cat(batches)
+    raise RuntimeError(f"Could not generate {count} full-rank {dof}-DoF chains")
 
 
 def generate_robot_bank(
@@ -94,7 +124,7 @@ def generate_robot_bank(
     for dof in DOF_CLASSES:
         for destination, size in ((train, train_per_dof), (holdout, holdout_per_dof)):
             for offset in range(0, size, 4096):
-                destination.append(_procedural_robots(min(4096, size - offset), dof, generator))
+                destination.append(_sample_morphologies(min(4096, size - offset), dof, generator))
     return RobotBatch.cat(train), RobotBatch.cat(holdout)
 
 
@@ -156,12 +186,16 @@ class IKBatch:
         return IKBatch(self.robots[index], self.joints[index], self.position[index], self.orientation[index])
 
 
+def _sample_angles(robots: RobotBatch, generator: torch.Generator) -> Tensor:
+    limits = robots.half_ranges
+    unit_values = torch.rand(limits.shape, dtype=limits.dtype, device=limits.device, generator=generator)
+    return (2 * unit_values - 1) * limits
+
+
 def _draw_poses(
     robots: RobotBatch, generator: torch.Generator, check_collisions: bool
 ) -> tuple[IKBatch, Tensor]:
-    limits = robots.half_ranges
-    unit_values = torch.rand(limits.shape, dtype=limits.dtype, device=limits.device, generator=generator)
-    joints = (2 * unit_values - 1) * limits
+    joints = _sample_angles(robots, generator)
     if check_collisions:
         position, orientation, points, _ = posed_chain(robots, joints)
         valid = ~capsule_collisions(robots, points, position)
